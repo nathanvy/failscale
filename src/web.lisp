@@ -1,0 +1,80 @@
+(in-package #:failscale/server)
+
+(defparameter *app* nil)
+(defparameter *server* nil)
+
+(defun json-response (obj &key (status 200))
+  (let ((body (shasht:write-json obj nil)))
+    (list status
+          (list :content-type "application/json")
+          (list body))))
+
+(defun remote-ip (env)
+  (or (header env "x-forwarded-for")
+      (getf env :remote-addr)
+      "0.0.0.0"))
+
+(defun handle-sync (params)
+  (declare (ignorable params))
+  (handler-case
+      (let* ((req ningle:*request*)
+             (env (lack.request:request-env req))
+             (reg-hex (verify-request env))
+             (body-bytes (request-body-bytes env))
+             (body (when (> (length body-bytes) 0)
+                     (with-input-from-string (in (octets-to-utf8 body-bytes))
+                       (shasht:read-json in))))
+             (listen-port (or (gethash :listen_port body) 51820))
+             (endpoint-hint (gethash :endpoint_hint body))
+             (wg-pub (gethash :wg_pub body))
+             (keepalive (gethash :keepalive body))
+             (addr (ensure-lease reg-hex))
+             (n (gethash reg-hex *nodes*))
+             (rip (remote-ip env))
+             (endpoint (or endpoint-hint (format nil "~A:~D" rip listen-port))))
+        ;; update node record
+        (bt:with-lock-held (*state-lock*)
+          (setf (node-wg-pub-b64 n) wg-pub
+                (node-endpoint n) endpoint
+                (node-keepalive n) keepalive
+                (node-last-seen n) (local-time:now)))
+        (persist-leases)
+        ;; peers = everyone except self
+        (let ((peers (loop for k being the hash-keys in *nodes*
+                           for v being the hash-values in *nodes*
+                           unless (string= k reg-hex)
+                             collect (let ((ip (node-addr-v4 v)))
+                                       (let ((h (make-hash-table :test #'equal)))
+                                         (setf (gethash :addr_v4 h) ip)
+                                         (setf (gethash :wg_pub h) (node-wg-pub-b64 v))
+                                         (setf (gethash :endpoint h) (node-endpoint v))
+                                         (setf (gethash :keepalive h) (or (node-keepalive v) 25))
+                                         h)))))
+          (json-response (let ((res (make-hash-table :test #'equal)))
+                           (setf (gethash :self res)
+                                 (let ((s (make-hash-table :test #'equal)))
+                                   (setf (gethash :addr_v4 s) addr)
+                                   (setf (gethash :cidr_v4 s) (cfg :cidr-v4))
+                                   s))
+                           (setf (gethash :peers res) (coerce peers 'vector))
+                           res))))
+    (auth-error (e)
+      (json-response (let ((h (make-hash-table :test #'equal)))
+                       (setf (gethash :error h) (auth-error-message e)) h)
+                     :status 401))
+    (error (e)
+      (json-response (let ((h (make-hash-table :test #'equal)))
+                       (setf (gethash :error h) (princ-to-string e)) h)
+                     :status 500))))
+
+
+(defun make-app ()
+  (let ((router (make-instance 'ningle:app)))
+    (setf (ningle:route router "/v1/sync" :method :POST)
+          #'handle-sync)
+    (setf (ningle:route router "/healthz" :method :GET)
+          (lambda (env)
+            (declare (ignore env))
+            (json-response (let ((h (make-hash-table :test #'equal)))
+                             (setf (gethash :ok h) t) h))))
+    router))
